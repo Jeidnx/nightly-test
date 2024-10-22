@@ -1,0 +1,137 @@
+name: Nightly builds
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [build-nightly]
+
+jobs:
+  nightly-builds:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: nightly
+      - uses: actions/checkout@v4
+        with:
+          # TODO: changeme
+          repository: jeidnx/LibreTube
+          path: libretube
+
+      - name: Set variables
+        id: var
+        run: |
+          ref="${{ github.event.client_payload.ref }}"
+          sha="${{ github.event.client_payload.sha }}"
+          if [[ -z ${ref} ]]; then
+            cd "${GITHUB_WORKSPACE}/libretube"
+            # Get revision from local copy
+            ref=$(git rev-parse --abbrev-ref HEAD)
+            sha=$(git rev-parse HEAD)
+          fi
+
+          # TODO: If tag for this day exists, add suffix
+          
+          date=$(date +'%Y-%m-%d')
+          echo "date=${date}" >> $GITHUB_OUTPUT
+          echo "id=${date}_1" >> $GITHUB_OUTPUT
+          echo "ref=${ref}" >> $GITHUB_OUTPUT
+          echo "sha=${sha}" >> $GITHUB_OUTPUT
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+          echo "Set environment for this run:"
+          cat $GITHUB_OUTPUT
+
+      - uses: gradle/actions/wrapper-validation@v3
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: "temurin"
+          cache: "gradle"
+
+      - name: Compile
+        run: |
+          cd "${GITHUB_WORKSPACE}/libretube"
+          ./gradlew assembleDebug assembleRelease
+
+      - name: Move unsigned APKs
+        run: |
+          mkdir -p ~/unsigned
+          cd "${GITHUB_WORKSPACE}/libretube"
+          mv app/build/outputs/apk/debug/*.apk ~/unsigned
+          mv app/build/outputs/apk/release/*.apk ~/unsigned
+
+      # - name: Sign APKs
+      #   id: sign_apk
+      #   # Switch to v2 when that is released, see https://github.com/ilharp/sign-android-release/issues/24#issuecomment-2414013354
+      #   uses: ilharp/sign-android-release@nightly
+      #   with:
+      #     releaseDir: unsigned
+      #     signingKey: ${{ secrets.ANDROID_SIGNING_KEY }}
+      #     keyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
+      #     keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      #     keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Sign APKs
+        id: sign_apk
+        # Switch to v2 when that is released, see https://github.com/ilharp/sign-android-release/issues/24#issuecomment-2414013354
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: unsigned
+          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
+          alias: ${{ secrets.ANDROID_KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Rename signed APKs
+        run: |
+          mkdir -p ~/signed
+          while read -r file; do
+            variant=$(echo "${file}" | sed -rn 's/(.*)app-(.+?)-(debug|release)(-unsigned)?-signed.apk$/\2-\3/p')
+            mv "${file}" "~/signed/libretube-${variant}_${{ steps.var.outputs.id }}.apk"
+          # done <<< "$(echo "${ANDROID_SIGNED_FILES}" | tr ":" "\n")"
+          done <<< "$(echo "${SIGNED_RELEASE_FILES}" | tr ":" "\n")"
+
+          echo "Renamed these files:"
+          ls -1 ~/signed/
+        
+      - name: Update readme and push tag
+        id: nightly
+        env:
+          DATE: ${{ steps.var.outputs.date }}
+          SHA_SHORT: ${{ steps.var.outputs.sha_short }}
+          SHA: ${{ steps.var.outputs.sha }}
+          REF: ${{ steps.var.outputs.ref }}
+          # TODO: changeme
+          NIGHTLY_REPO: "jeidnx/nightly-test"
+          MAIN_REPO: "jeidnx/LibreTube"
+        run: |
+          cd "${GITHUB_WORKSPACE}/nightly"
+          git config user.name "libretube-bot"
+          git config user.email "libretube@proton.me"
+
+          # Update README
+          envsubst < readme_template.md > README.md
+          git add README.md
+          git commit -m "update README.md"
+
+          git tag ${{ steps.var.outputs.date }}
+          git push --tags origin main
+           
+          # Prepare release body
+          envsubst < release_template.md > finished_release.md
+          echo "release_path=$(realpath finished_release.md)" >> $GITHUB_OUTPUT
+          
+      - name: Create nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          # repository: libre-tube/NightlyBuilds
+          repository: jeidnx/nightly-test
+          name: LibreTube nightly ${{ steps.var.outputs.date }}
+          tag_name: ${{ steps.var.outputs.date }}
+          body_path: ${{ steps.nightly.outputs.release_path }}
+          # token: ${{ secrets.GH_TOKEN }}
+          files: "~/signed/*.apk"
+
